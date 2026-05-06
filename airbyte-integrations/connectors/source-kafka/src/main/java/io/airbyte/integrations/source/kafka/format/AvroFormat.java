@@ -53,6 +53,7 @@ public class AvroFormat extends AbstractFormat {
 
   public AvroFormat(JsonNode jsonConfig) {
     super(jsonConfig);
+    LOGGER.info("Simple Solutions version");
   }
 
   @Override
@@ -64,7 +65,8 @@ public class AvroFormat extends AbstractFormat {
     if (avro_config.has("schema_registry_username")) {
       props.put(SchemaRegistryClientConfig.BASIC_AUTH_CREDENTIALS_SOURCE, "USER_INFO");
       props.put(SchemaRegistryClientConfig.USER_INFO_CONFIG,
-          String.format("%s:%s", avro_config.get("schema_registry_username").asText(), avro_config.get("schema_registry_password").asText()));
+          String.format("%s:%s", avro_config.get("schema_registry_username").asText(),
+              avro_config.get("schema_registry_password").asText()));
     } else {
       // If the registry username is missing; and the sasl_mechanism == OAUTHBEARER
       final JsonNode protocolConfig = config.get("protocol");
@@ -161,7 +163,8 @@ public class AvroFormat extends AbstractFormat {
     final Map<String, Integer> poll_lookup = new HashMap<>();
     getTopicsToSubscribe().forEach(topic -> poll_lookup.put(topic, 0));
     while (true) {
-      final ConsumerRecords<String, GenericRecord> consumerRecords = consumer.poll(Duration.of(polling_time, ChronoUnit.MILLIS));
+      final ConsumerRecords<String, GenericRecord> consumerRecords = consumer
+          .poll(Duration.of(polling_time, ChronoUnit.MILLIS));
       consumerRecords.forEach(record -> {
         record_count.getAndIncrement();
         recordsList.add(record);
@@ -198,7 +201,8 @@ public class AvroFormat extends AbstractFormat {
           String name = avro_data.getSchema().getName();
           JsonNode output;
           try {
-            // Todo dynamic namespace is not supported now hence, adding avro schema name in the message
+            // Todo dynamic namespace is not supported now hence, adding avro schema name in
+            // the message
             if (StringUtils.isNoneEmpty(namespace) && StringUtils.isNoneEmpty(name)) {
               String newString = String.format("{\"avro_schema\": \"%s\",\"name\":\"%s\"}", namespace, name);
               JsonNode newNode = mapper.readTree(newString);

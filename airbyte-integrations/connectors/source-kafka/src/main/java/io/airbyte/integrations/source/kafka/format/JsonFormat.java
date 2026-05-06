@@ -43,6 +43,7 @@ public class JsonFormat extends AbstractFormat {
 
   public JsonFormat(JsonNode jsonConfig) {
     super(jsonConfig);
+    LOGGER.info("Simple Solutions version");
   }
 
   @Override
@@ -117,7 +118,8 @@ public class JsonFormat extends AbstractFormat {
     final Map<String, Integer> poll_lookup = new HashMap<>();
     getTopicsToSubscribe().forEach(topic -> poll_lookup.put(topic, 0));
     while (true) {
-      final ConsumerRecords<String, JsonNode> consumerRecords = consumer.poll(Duration.of(polling_time, ChronoUnit.MILLIS));
+      final ConsumerRecords<String, JsonNode> consumerRecords = consumer
+          .poll(Duration.of(polling_time, ChronoUnit.MILLIS));
       consumerRecords.forEach(record -> {
         record_count.getAndIncrement();
         recordsList.add(record);
