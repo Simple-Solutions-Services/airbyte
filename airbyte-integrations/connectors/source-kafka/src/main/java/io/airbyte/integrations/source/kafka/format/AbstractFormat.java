@@ -5,19 +5,38 @@
 package io.airbyte.integrations.source.kafka.format;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.common.collect.AbstractIterator;
 import com.google.common.collect.ImmutableMap;
 import io.airbyte.commons.json.Jsons;
+import io.airbyte.commons.util.AutoCloseableIterator;
+import io.airbyte.commons.util.AutoCloseableIterators;
 import io.airbyte.integrations.source.kafka.KafkaProtocol;
+import io.airbyte.protocol.models.v0.AirbyteMessage;
+import io.airbyte.protocol.models.v0.AirbyteStateMessage;
+import java.time.Duration;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.config.SaslConfigs;
 import org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule;
 import org.apache.kafka.common.security.oauthbearer.secured.OAuthBearerLoginCallbackHandler;
+import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.msk.auth.iam.IAMClientCallbackHandler;
@@ -28,6 +47,8 @@ public abstract class AbstractFormat implements KafkaFormat {
 
   protected Set<String> topicsToSubscribe;
   protected JsonNode config;
+  private KafkaOffsetState offsetState = KafkaOffsetState.empty();
+  private boolean manageOffsets;
 
   public AbstractFormat(JsonNode config) {
     this.config = config;
@@ -37,6 +58,149 @@ public abstract class AbstractFormat implements KafkaFormat {
   protected abstract KafkaConsumer<String, ?> getConsumer();
 
   protected abstract Set<String> getTopicsToSubscribe();
+
+  protected void prepareForRead(final JsonNode state) {
+    offsetState = KafkaOffsetState.fromJson(state);
+    manageOffsets = true;
+  }
+
+  protected boolean shouldManageOffsets() {
+    return manageOffsets;
+  }
+
+  protected ConsumerRebalanceListener statefulRebalanceListener(final KafkaConsumer<?, ?> consumer) {
+    return new ConsumerRebalanceListener() {
+
+      @Override
+      public void onPartitionsRevoked(final Collection<TopicPartition> partitions) {}
+
+      @Override
+      public void onPartitionsAssigned(final Collection<TopicPartition> partitions) {
+        seekToStateOrConfiguredStart(consumer, partitions);
+      }
+
+    };
+  }
+
+  protected void seekToStateOrConfiguredStart(final KafkaConsumer<?, ?> consumer,
+                                              final Collection<TopicPartition> partitions) {
+    if (!shouldManageOffsets() || partitions.isEmpty()) {
+      return;
+    }
+
+    final List<TopicPartition> seekToBeginning = new ArrayList<>();
+    final List<TopicPartition> seekToEnd = new ArrayList<>();
+    for (final TopicPartition partition : partitions) {
+      final OptionalLong offset = offsetState.getOffset(partition);
+      if (offset.isPresent()) {
+        consumer.seek(partition, offset.getAsLong());
+      } else {
+        switch (getAutoOffsetReset()) {
+          case "earliest" -> seekToBeginning.add(partition);
+          case "latest" -> seekToEnd.add(partition);
+          case "none" -> throw new IllegalStateException(
+              "No Airbyte state for Kafka partition " + partition + " and auto_offset_reset is none.");
+          default -> throw new IllegalArgumentException("Unsupported auto_offset_reset value: " + getAutoOffsetReset());
+        }
+      }
+    }
+
+    if (!seekToBeginning.isEmpty()) {
+      consumer.seekToBeginning(seekToBeginning);
+    }
+    if (!seekToEnd.isEmpty()) {
+      consumer.seekToEnd(seekToEnd);
+    }
+  }
+
+  protected <T> AutoCloseableIterator<AirbyteMessage> readRecords(final KafkaConsumer<String, T> consumer,
+                                                                  final Function<ConsumerRecord<String, T>, AirbyteMessage> messageFactory) {
+    final int retry = config.has("repeated_calls") ? config.get("repeated_calls").intValue() : 0;
+    final int pollingTime = config.has("polling_time") ? config.get("polling_time").intValue() : 100;
+    final int maxRecords = config.has("max_records_process") ? config.get("max_records_process").intValue() : 100000;
+    final Map<String, Integer> emptyPollsByTopic = new HashMap<>();
+    getTopicsToSubscribe().forEach(topic -> emptyPollsByTopic.put(topic, 0));
+    final AtomicBoolean closed = new AtomicBoolean(false);
+
+    final Iterator<AirbyteMessage> iterator = new AbstractIterator<>() {
+
+      private Iterator<ConsumerRecord<String, T>> records = Collections.emptyIterator();
+      private boolean pendingState;
+      private boolean stateDirty;
+      private int recordCount;
+
+      @Override
+      protected AirbyteMessage computeNext() {
+        if (pendingState) {
+          pendingState = false;
+          stateDirty = false;
+          return stateMessage();
+        }
+
+        if (recordCount >= maxRecords) {
+          LOGGER.info("Max record count is reached.");
+          return finish();
+        }
+
+        while (!records.hasNext()) {
+          final ConsumerRecords<String, T> consumerRecords = consumer.poll(Duration.of(pollingTime, ChronoUnit.MILLIS));
+          if (consumerRecords.count() == 0) {
+            consumer.assignment().stream()
+                .map(TopicPartition::topic)
+                .distinct()
+                .forEach(topic -> emptyPollsByTopic.merge(topic, 1, Integer::sum));
+
+            final boolean complete = emptyPollsByTopic.values().stream().allMatch(emptyPollCount -> emptyPollCount > retry);
+            if (complete) {
+              LOGGER.info("There is no new data in the queue.");
+              return finish();
+            }
+          } else {
+            emptyPollsByTopic.replaceAll((topic, emptyPollCount) -> 0);
+            records = consumerRecords.iterator();
+          }
+        }
+
+        final ConsumerRecord<String, T> record = records.next();
+        final AirbyteMessage message = messageFactory.apply(record);
+        recordCount++;
+        offsetState.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
+        pendingState = true;
+        stateDirty = true;
+        return message;
+      }
+
+      private AirbyteMessage finish() {
+        if (stateDirty) {
+          stateDirty = false;
+          return stateMessage();
+        }
+        closeConsumer(consumer, closed);
+        return endOfData();
+      }
+
+    };
+
+    return AutoCloseableIterators.fromIterator(iterator, () -> closeConsumer(consumer, closed), null);
+  }
+
+  private AirbyteMessage stateMessage() {
+    return new AirbyteMessage()
+        .withType(AirbyteMessage.Type.STATE)
+        .withState(new AirbyteStateMessage()
+            .withType(AirbyteStateMessage.AirbyteStateType.LEGACY)
+            .withData(offsetState.toJson()));
+  }
+
+  private void closeConsumer(final KafkaConsumer<?, ?> consumer, final AtomicBoolean closed) {
+    if (closed.compareAndSet(false, true)) {
+      consumer.close();
+    }
+  }
+
+  private String getAutoOffsetReset() {
+    return config.has("auto_offset_reset") ? config.get("auto_offset_reset").asText() : "latest";
+  }
 
   protected Map<String, Object> getKafkaConfig() {
 
@@ -50,7 +214,10 @@ public abstract class AbstractFormat implements KafkaFormat {
     props.put(ConsumerConfig.CLIENT_ID_CONFIG,
         config.has("client_id") ? config.get("client_id").asText() : null);
     props.put(ConsumerConfig.CLIENT_DNS_LOOKUP_CONFIG, config.get("client_dns_lookup").asText());
-    props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, config.get("enable_auto_commit").booleanValue());
+    if (config.has("enable_auto_commit") && config.get("enable_auto_commit").booleanValue()) {
+      LOGGER.warn("Ignoring enable_auto_commit=true. Kafka source offsets are managed through Airbyte state.");
+    }
+    props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
     props.put(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG,
         config.has("auto_commit_interval_ms") ? config.get("auto_commit_interval_ms").intValue() : null);
     props.put(ConsumerConfig.RETRY_BACKOFF_MS_CONFIG,

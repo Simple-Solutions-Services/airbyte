@@ -52,7 +52,7 @@ public class KafkaSource extends BaseConnector implements Source {
       throw new RuntimeException("Unable establish a connection: " + check.getMessage());
     }
     KafkaFormat kafkaFormat = KafkaFormatFactory.getFormat(config);
-    return kafkaFormat.read();
+    return kafkaFormat.read(state);
   }
 
   public static void main(final String[] args) throws Exception {
