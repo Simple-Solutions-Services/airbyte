@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -62,6 +63,8 @@ public abstract class AbstractFormat implements KafkaFormat {
   protected void prepareForRead(final JsonNode state) {
     offsetState = KafkaOffsetState.fromJson(state);
     manageOffsets = true;
+    LOGGER.debug("Prepared Kafka read with Airbyte offset state: {}", offsetState.toJson());
+    LOGGER.debug("Kafka broker offset commits are disabled; Airbyte STATE messages are used as checkpoints.");
   }
 
   protected boolean shouldManageOffsets() {
@@ -72,10 +75,13 @@ public abstract class AbstractFormat implements KafkaFormat {
     return new ConsumerRebalanceListener() {
 
       @Override
-      public void onPartitionsRevoked(final Collection<TopicPartition> partitions) {}
+      public void onPartitionsRevoked(final Collection<TopicPartition> partitions) {
+        LOGGER.debug("Kafka partitions revoked: {}", partitions);
+      }
 
       @Override
       public void onPartitionsAssigned(final Collection<TopicPartition> partitions) {
+        LOGGER.debug("Kafka partitions assigned: {}", partitions);
         seekToStateOrConfiguredStart(consumer, partitions);
       }
 
@@ -90,14 +96,23 @@ public abstract class AbstractFormat implements KafkaFormat {
 
     final List<TopicPartition> seekToBeginning = new ArrayList<>();
     final List<TopicPartition> seekToEnd = new ArrayList<>();
+    LOGGER.debug("Seeking assigned Kafka partitions using Airbyte state. partitions={}, auto_offset_reset={}, state={}",
+        partitions, getAutoOffsetReset(), offsetState.toJson());
     for (final TopicPartition partition : partitions) {
       final OptionalLong offset = offsetState.getOffset(partition);
       if (offset.isPresent()) {
         consumer.seek(partition, offset.getAsLong());
+        LOGGER.debug("Seeking Kafka partition {} to Airbyte state offset {}.", partition, offset.getAsLong());
       } else {
         switch (getAutoOffsetReset()) {
-          case "earliest" -> seekToBeginning.add(partition);
-          case "latest" -> seekToEnd.add(partition);
+          case "earliest" -> {
+            seekToBeginning.add(partition);
+            LOGGER.debug("No Airbyte state for Kafka partition {}; seeking to beginning.", partition);
+          }
+          case "latest" -> {
+            seekToEnd.add(partition);
+            LOGGER.debug("No Airbyte state for Kafka partition {}; seeking to end.", partition);
+          }
           case "none" -> throw new IllegalStateException(
               "No Airbyte state for Kafka partition " + partition + " and auto_offset_reset is none.");
           default -> throw new IllegalArgumentException("Unsupported auto_offset_reset value: " + getAutoOffsetReset());
@@ -121,6 +136,8 @@ public abstract class AbstractFormat implements KafkaFormat {
     final Map<String, Integer> emptyPollsByTopic = new HashMap<>();
     getTopicsToSubscribe().forEach(topic -> emptyPollsByTopic.put(topic, 0));
     final AtomicBoolean closed = new AtomicBoolean(false);
+    LOGGER.debug("Starting Kafka read. topics={}, pollingTimeMs={}, repeatedCalls={}, maxRecords={}, initialOffsets={}",
+        getTopicsToSubscribe(), pollingTime, retry, maxRecords, offsetState.toJson());
 
     final Iterator<AirbyteMessage> iterator = new AbstractIterator<>() {
 
@@ -128,12 +145,15 @@ public abstract class AbstractFormat implements KafkaFormat {
       private boolean pendingState;
       private boolean stateDirty;
       private int recordCount;
+      private long pollCount;
+      private long receivedCount;
 
       @Override
       protected AirbyteMessage computeNext() {
         if (pendingState) {
           pendingState = false;
           stateDirty = false;
+          LOGGER.debug("Emitting Airbyte STATE checkpoint. emittedRecords={}, offsets={}", recordCount, offsetState.toJson());
           return stateMessage();
         }
 
@@ -144,6 +164,10 @@ public abstract class AbstractFormat implements KafkaFormat {
 
         while (!records.hasNext()) {
           final ConsumerRecords<String, T> consumerRecords = consumer.poll(Duration.of(pollingTime, ChronoUnit.MILLIS));
+          pollCount++;
+          receivedCount += consumerRecords.count();
+          LOGGER.debug("Kafka poll completed. pollNumber={}, receivedRecords={}, partitionProgress={}, totalReceivedRecords={}, emittedRecords={}",
+              pollCount, consumerRecords.count(), partitionProgress(consumerRecords), receivedCount, recordCount);
           if (consumerRecords.count() == 0) {
             consumer.assignment().stream()
                 .map(TopicPartition::topic)
@@ -151,6 +175,8 @@ public abstract class AbstractFormat implements KafkaFormat {
                 .forEach(topic -> emptyPollsByTopic.merge(topic, 1, Integer::sum));
 
             final boolean complete = emptyPollsByTopic.values().stream().allMatch(emptyPollCount -> emptyPollCount > retry);
+            LOGGER.debug("Kafka empty poll progress. pollNumber={}, emptyPollsByTopic={}, complete={}",
+                pollCount, emptyPollsByTopic, complete);
             if (complete) {
               LOGGER.info("There is no new data in the queue.");
               return finish();
@@ -165,6 +191,8 @@ public abstract class AbstractFormat implements KafkaFormat {
         final AirbyteMessage message = messageFactory.apply(record);
         recordCount++;
         offsetState.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
+        LOGGER.debug("Emitting Kafka record. topic={}, partition={}, offset={}, nextOffset={}, emittedRecords={}",
+            record.topic(), record.partition(), record.offset(), record.offset() + 1, recordCount);
         pendingState = true;
         stateDirty = true;
         return message;
@@ -173,8 +201,11 @@ public abstract class AbstractFormat implements KafkaFormat {
       private AirbyteMessage finish() {
         if (stateDirty) {
           stateDirty = false;
+          LOGGER.debug("Emitting final Airbyte STATE checkpoint. emittedRecords={}, offsets={}", recordCount, offsetState.toJson());
           return stateMessage();
         }
+        LOGGER.debug("Kafka read finished. polls={}, receivedRecords={}, emittedRecords={}, finalOffsets={}",
+            pollCount, receivedCount, recordCount, offsetState.toJson());
         closeConsumer(consumer, closed);
         return endOfData();
       }
@@ -194,8 +225,21 @@ public abstract class AbstractFormat implements KafkaFormat {
 
   private void closeConsumer(final KafkaConsumer<?, ?> consumer, final AtomicBoolean closed) {
     if (closed.compareAndSet(false, true)) {
+      LOGGER.debug("Closing Kafka consumer.");
       consumer.close();
     }
+  }
+
+  private Map<String, String> partitionProgress(final ConsumerRecords<?, ?> records) {
+    final Map<String, String> progress = new TreeMap<>();
+    records.partitions().forEach(partition -> {
+      final List<? extends ConsumerRecord<?, ?>> partitionRecords = records.records(partition);
+      final ConsumerRecord<?, ?> firstRecord = partitionRecords.get(0);
+      final ConsumerRecord<?, ?> lastRecord = partitionRecords.get(partitionRecords.size() - 1);
+      progress.put(partition.toString(),
+          String.format("count=%d, offsets=%d..%d", partitionRecords.size(), firstRecord.offset(), lastRecord.offset()));
+    });
+    return progress;
   }
 
   private String getAutoOffsetReset() {
