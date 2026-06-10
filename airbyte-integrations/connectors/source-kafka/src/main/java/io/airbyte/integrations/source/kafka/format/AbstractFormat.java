@@ -34,6 +34,7 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.config.SaslConfigs;
 import org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule;
 import org.apache.kafka.common.security.oauthbearer.secured.OAuthBearerLoginCallbackHandler;
@@ -63,8 +64,8 @@ public abstract class AbstractFormat implements KafkaFormat {
   protected void prepareForRead(final JsonNode state) {
     offsetState = KafkaOffsetState.fromJson(state);
     manageOffsets = true;
-    LOGGER.debug("Prepared Kafka read with Airbyte offset state: {}", offsetState.toJson());
-    LOGGER.debug("Kafka broker offset commits are disabled; Airbyte STATE messages are used as checkpoints.");
+    LOGGER.info("Prepared Kafka read with Airbyte offset state: {}", offsetState.toJson());
+    LOGGER.info("Kafka broker auto-commit is disabled; Airbyte STATE messages are the checkpoint source of truth, mirrored to the broker on start.");
   }
 
   protected boolean shouldManageOffsets() {
@@ -96,22 +97,24 @@ public abstract class AbstractFormat implements KafkaFormat {
 
     final List<TopicPartition> seekToBeginning = new ArrayList<>();
     final List<TopicPartition> seekToEnd = new ArrayList<>();
-    LOGGER.debug("Seeking assigned Kafka partitions using Airbyte state. partitions={}, auto_offset_reset={}, state={}",
+    final Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = new HashMap<>();
+    LOGGER.info("Seeking assigned Kafka partitions using Airbyte state. partitions={}, auto_offset_reset={}, state={}",
         partitions, getAutoOffsetReset(), offsetState.toJson());
     for (final TopicPartition partition : partitions) {
       final OptionalLong offset = offsetState.getOffset(partition);
       if (offset.isPresent()) {
         consumer.seek(partition, offset.getAsLong());
-        LOGGER.debug("Seeking Kafka partition {} to Airbyte state offset {}.", partition, offset.getAsLong());
+        offsetsToCommit.put(partition, new OffsetAndMetadata(offset.getAsLong()));
+        LOGGER.info("Seeking Kafka partition {} to Airbyte state offset {}.", partition, offset.getAsLong());
       } else {
         switch (getAutoOffsetReset()) {
           case "earliest" -> {
             seekToBeginning.add(partition);
-            LOGGER.debug("No Airbyte state for Kafka partition {}; seeking to beginning.", partition);
+            LOGGER.info("No Airbyte state for Kafka partition {}; seeking to beginning.", partition);
           }
           case "latest" -> {
             seekToEnd.add(partition);
-            LOGGER.debug("No Airbyte state for Kafka partition {}; seeking to end.", partition);
+            LOGGER.info("No Airbyte state for Kafka partition {}; seeking to end.", partition);
           }
           case "none" -> throw new IllegalStateException(
               "No Airbyte state for Kafka partition " + partition + " and auto_offset_reset is none.");
@@ -126,6 +129,40 @@ public abstract class AbstractFormat implements KafkaFormat {
     if (!seekToEnd.isEmpty()) {
       consumer.seekToEnd(seekToEnd);
     }
+
+    commitStateOffsetsToBroker(consumer, offsetsToCommit);
+  }
+
+  /**
+   * Mirrors the offsets carried in the incoming Airbyte state back to the Kafka broker as
+   * consumer-group commits, so broker-side tooling (e.g. Kafdrop) reflects the connector's position.
+   *
+   * <p>This is intentionally driven only by the <em>incoming</em> state — i.e. data already
+   * confirmed delivered by Airbyte in a prior sync — and never by offsets accumulated mid-run.
+   * That keeps the at-least-once guarantee intact: the Airbyte STATE remains the source of truth,
+   * and the broker commit is a best-effort, observability-only mirror. A commit failure is logged
+   * and swallowed rather than failing the sync.
+   */
+  private void commitStateOffsetsToBroker(final KafkaConsumer<?, ?> consumer,
+                                          final Map<TopicPartition, OffsetAndMetadata> offsetsToCommit) {
+    if (offsetsToCommit.isEmpty()) {
+      return;
+    }
+    if (!hasGroupId()) {
+      LOGGER.warn("Skipping Kafka broker offset commit: no group_id configured. partitions={}", offsetsToCommit.keySet());
+      return;
+    }
+    try {
+      consumer.commitSync(offsetsToCommit);
+      LOGGER.info("Committed Airbyte state offsets back to Kafka broker. offsets={}", offsetsToCommit);
+    } catch (final RuntimeException e) {
+      LOGGER.warn("Failed to commit Airbyte state offsets to Kafka broker; continuing with Airbyte state as source of truth. offsets={}",
+          offsetsToCommit, e);
+    }
+  }
+
+  private boolean hasGroupId() {
+    return config.has("group_id") && !config.get("group_id").asText().isBlank();
   }
 
   protected <T> AutoCloseableIterator<AirbyteMessage> readRecords(final KafkaConsumer<String, T> consumer,
@@ -136,7 +173,7 @@ public abstract class AbstractFormat implements KafkaFormat {
     final Map<String, Integer> emptyPollsByTopic = new HashMap<>();
     getTopicsToSubscribe().forEach(topic -> emptyPollsByTopic.put(topic, 0));
     final AtomicBoolean closed = new AtomicBoolean(false);
-    LOGGER.debug("Starting Kafka read. topics={}, pollingTimeMs={}, repeatedCalls={}, maxRecords={}, initialOffsets={}",
+    LOGGER.info("Starting Kafka read. topics={}, pollingTimeMs={}, repeatedCalls={}, maxRecords={}, initialOffsets={}",
         getTopicsToSubscribe(), pollingTime, retry, maxRecords, offsetState.toJson());
 
     final Iterator<AirbyteMessage> iterator = new AbstractIterator<>() {
@@ -201,10 +238,10 @@ public abstract class AbstractFormat implements KafkaFormat {
       private AirbyteMessage finish() {
         if (stateDirty) {
           stateDirty = false;
-          LOGGER.debug("Emitting final Airbyte STATE checkpoint. emittedRecords={}, offsets={}", recordCount, offsetState.toJson());
+          LOGGER.info("Emitting final Airbyte STATE checkpoint. emittedRecords={}, offsets={}", recordCount, offsetState.toJson());
           return stateMessage();
         }
-        LOGGER.debug("Kafka read finished. polls={}, receivedRecords={}, emittedRecords={}, finalOffsets={}",
+        LOGGER.info("Kafka read finished. polls={}, receivedRecords={}, emittedRecords={}, finalOffsets={}",
             pollCount, receivedCount, recordCount, offsetState.toJson());
         closeConsumer(consumer, closed);
         return endOfData();
