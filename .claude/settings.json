@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -rn \"SyncMode\\\\|withSupportedSyncModes\\\\|withSourceDefinedCursor\" airbyte-integrations/connectors/source-kafka/src/main/java/io/airbyte/integrations/source/kafka/format/JsonFormat.java | head -5; echo \"---protocol models---\"; find ~/.gradle -name \"airbyte-protocol*.jar\" 2>/dev/null | head -3; grep -rn \"AirbyteStreamState\\\\|StreamDescriptor\" airbyte-integrations/connectors/source-kafka/src/main/java/ | head)",
+      "Read(//home/mikeadam/.gradle/**)"
+    ]
+  }
+}

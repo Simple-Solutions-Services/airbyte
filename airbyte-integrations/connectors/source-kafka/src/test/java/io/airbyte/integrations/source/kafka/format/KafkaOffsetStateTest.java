@@ -8,7 +8,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import io.airbyte.commons.json.Jsons;
+import java.util.Set;
 import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.Test;
 
@@ -55,6 +57,45 @@ class KafkaOffsetStateTest {
         """));
 
     assertEquals(42, state.getOffset(new TopicPartition("topic-a", 0)).getAsLong());
+  }
+
+  @Test
+  void parsesPerStreamStateList() {
+    // Shape the platform passes back when the source emits STREAM state messages.
+    final KafkaOffsetState state = KafkaOffsetState.fromJson(Jsons.deserialize("""
+        [
+          {
+            "type": "STREAM",
+            "stream": {
+              "stream_descriptor": { "name": "topic-a" },
+              "stream_state": { "offsets": { "topic-a": { "0": 7 } } }
+            }
+          },
+          {
+            "type": "STREAM",
+            "stream": {
+              "stream_descriptor": { "name": "topic-b" },
+              "stream_state": { "offsets": { "topic-b": { "2": 21 } } }
+            }
+          }
+        ]
+        """));
+
+    assertEquals(7, state.getOffset(new TopicPartition("topic-a", 0)).getAsLong());
+    assertEquals(21, state.getOffset(new TopicPartition("topic-b", 2)).getAsLong());
+  }
+
+  @Test
+  void serializesSingleTopicStreamState() {
+    final KafkaOffsetState state = KafkaOffsetState.empty();
+    state.put(new TopicPartition("topic-a", 0), 12);
+    state.put(new TopicPartition("topic-b", 1), 34);
+
+    assertEquals(Set.of("topic-a", "topic-b"), state.topics());
+
+    final JsonNode topicA = state.toJson("topic-a");
+    assertEquals(12, topicA.get("offsets").get("topic-a").get("0").asLong());
+    assertFalse(topicA.get("offsets").has("topic-b"));
   }
 
   @Test

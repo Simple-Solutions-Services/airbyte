@@ -13,11 +13,15 @@ import io.airbyte.commons.util.AutoCloseableIterators;
 import io.airbyte.integrations.source.kafka.KafkaProtocol;
 import io.airbyte.protocol.models.v0.AirbyteMessage;
 import io.airbyte.protocol.models.v0.AirbyteStateMessage;
+import io.airbyte.protocol.models.v0.AirbyteStreamState;
+import io.airbyte.protocol.models.v0.StreamDescriptor;
 import java.time.Duration;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -25,6 +29,7 @@ import java.util.Map;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -47,6 +52,13 @@ public abstract class AbstractFormat implements KafkaFormat {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(AbstractFormat.class);
 
+  /**
+   * Number of records between two emitted STATE checkpoints. Coarser checkpoints reduce
+   * platform-side state churn (vs. one STATE per record); on failure the connector re-reads from
+   * the last persisted checkpoint, so the at-least-once guarantee is unaffected.
+   */
+  private static final int STATE_CHECKPOINT_INTERVAL = 1000;
+
   protected Set<String> topicsToSubscribe;
   protected JsonNode config;
   private KafkaOffsetState offsetState = KafkaOffsetState.empty();
@@ -65,7 +77,7 @@ public abstract class AbstractFormat implements KafkaFormat {
     offsetState = KafkaOffsetState.fromJson(state);
     manageOffsets = true;
     LOGGER.info("Prepared Kafka read with Airbyte offset state: {}", offsetState.toJson());
-    LOGGER.info("Kafka broker auto-commit is disabled; Airbyte STATE messages are the checkpoint source of truth, mirrored to the broker on start.");
+    LOGGER.info("Kafka broker auto-commit is disabled; Airbyte STREAM state messages are the checkpoint source of truth, mirrored to the broker on start.");
   }
 
   protected boolean shouldManageOffsets() {
@@ -179,24 +191,27 @@ public abstract class AbstractFormat implements KafkaFormat {
     final Iterator<AirbyteMessage> iterator = new AbstractIterator<>() {
 
       private Iterator<ConsumerRecord<String, T>> records = Collections.emptyIterator();
-      private boolean pendingState;
-      private boolean stateDirty;
+      private final Deque<AirbyteMessage> pendingStates = new ArrayDeque<>();
+      private final Set<String> topicsSinceCheckpoint = new TreeSet<>();
+      private int recordsSinceCheckpoint;
+      private boolean readComplete;
       private int recordCount;
       private long pollCount;
       private long receivedCount;
 
       @Override
       protected AirbyteMessage computeNext() {
-        if (pendingState) {
-          pendingState = false;
-          stateDirty = false;
-          LOGGER.debug("Emitting Airbyte STATE checkpoint. emittedRecords={}, offsets={}", recordCount, offsetState.toJson());
-          return stateMessage();
+        if (!pendingStates.isEmpty()) {
+          return pendingStates.poll();
+        }
+
+        if (readComplete) {
+          return closeAndFinish();
         }
 
         if (recordCount >= maxRecords) {
           LOGGER.info("Max record count is reached.");
-          return finish();
+          return completeRead();
         }
 
         while (!records.hasNext()) {
@@ -216,7 +231,7 @@ public abstract class AbstractFormat implements KafkaFormat {
                 pollCount, emptyPollsByTopic, complete);
             if (complete) {
               LOGGER.info("There is no new data in the queue.");
-              return finish();
+              return completeRead();
             }
           } else {
             emptyPollsByTopic.replaceAll((topic, emptyPollCount) -> 0);
@@ -228,19 +243,39 @@ public abstract class AbstractFormat implements KafkaFormat {
         final AirbyteMessage message = messageFactory.apply(record);
         recordCount++;
         offsetState.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
+        topicsSinceCheckpoint.add(record.topic());
+        recordsSinceCheckpoint++;
         LOGGER.debug("Emitting Kafka record. topic={}, partition={}, offset={}, nextOffset={}, emittedRecords={}",
             record.topic(), record.partition(), record.offset(), record.offset() + 1, recordCount);
-        pendingState = true;
-        stateDirty = true;
+        if (recordsSinceCheckpoint >= STATE_CHECKPOINT_INTERVAL) {
+          enqueueStateCheckpoint();
+        }
         return message;
       }
 
-      private AirbyteMessage finish() {
-        if (stateDirty) {
-          stateDirty = false;
-          LOGGER.info("Emitting final Airbyte STATE checkpoint. emittedRecords={}, offsets={}", recordCount, offsetState.toJson());
-          return stateMessage();
+      /**
+       * Queues one STREAM state message per topic that advanced since the previous checkpoint. The
+       * states are emitted right after the record that triggered the checkpoint, so a state always
+       * follows the records it covers.
+       */
+      private void enqueueStateCheckpoint() {
+        LOGGER.info("Emitting Airbyte STREAM state checkpoint. topics={}, emittedRecords={}, offsets={}",
+            topicsSinceCheckpoint, recordCount, offsetState.toJson());
+        topicsSinceCheckpoint.forEach(topic -> pendingStates.add(stateMessage(topic)));
+        topicsSinceCheckpoint.clear();
+        recordsSinceCheckpoint = 0;
+      }
+
+      private AirbyteMessage completeRead() {
+        readComplete = true;
+        if (!topicsSinceCheckpoint.isEmpty()) {
+          enqueueStateCheckpoint();
+          return pendingStates.poll();
         }
+        return closeAndFinish();
+      }
+
+      private AirbyteMessage closeAndFinish() {
         LOGGER.info("Kafka read finished. polls={}, receivedRecords={}, emittedRecords={}, finalOffsets={}",
             pollCount, receivedCount, recordCount, offsetState.toJson());
         closeConsumer(consumer, closed);
@@ -252,12 +287,20 @@ public abstract class AbstractFormat implements KafkaFormat {
     return AutoCloseableIterators.fromIterator(iterator, () -> closeConsumer(consumer, closed), null);
   }
 
-  private AirbyteMessage stateMessage() {
+  /**
+   * Builds a per-stream (STREAM) state message for a single topic. The stream descriptor name
+   * matches the catalog stream name (= topic name). STREAM is the state type modern Airbyte
+   * platforms persist reliably — the previously used LEGACY type is deprecated and was silently
+   * dropped by the platform, freezing the connection state.
+   */
+  private AirbyteMessage stateMessage(final String topic) {
     return new AirbyteMessage()
         .withType(AirbyteMessage.Type.STATE)
         .withState(new AirbyteStateMessage()
-            .withType(AirbyteStateMessage.AirbyteStateType.LEGACY)
-            .withData(offsetState.toJson()));
+            .withType(AirbyteStateMessage.AirbyteStateType.STREAM)
+            .withStream(new AirbyteStreamState()
+                .withStreamDescriptor(new StreamDescriptor().withName(topic))
+                .withStreamState(offsetState.toJson(topic))));
   }
 
   private void closeConsumer(final KafkaConsumer<?, ?> consumer, final AtomicBoolean closed) {
