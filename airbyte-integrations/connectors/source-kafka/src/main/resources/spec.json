@@ -217,9 +217,9 @@
       },
       "enable_auto_commit": {
         "title": "Enable Auto Commit",
-        "description": "If true, the consumer's offset will be periodically committed in the background.",
+        "description": "Deprecated. Kafka source offsets are managed through Airbyte state to avoid data loss.",
         "type": "boolean",
-        "default": true
+        "default": false
       },
       "auto_commit_interval_ms": {
         "title": "Auto Commit Interval, ms",

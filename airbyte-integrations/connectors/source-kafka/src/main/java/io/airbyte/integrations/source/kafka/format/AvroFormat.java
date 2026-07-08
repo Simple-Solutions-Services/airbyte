@@ -8,12 +8,10 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.google.common.collect.AbstractIterator;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import io.airbyte.commons.json.Jsons;
 import io.airbyte.commons.util.AutoCloseableIterator;
-import io.airbyte.commons.util.AutoCloseableIterators;
 import io.airbyte.integrations.source.kafka.KafkaStrategy;
 import io.airbyte.protocol.models.Field;
 import io.airbyte.protocol.models.JsonSchemaType;
@@ -26,18 +24,14 @@ import io.confluent.kafka.schemaregistry.client.SchemaRegistryClientConfig;
 import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import io.confluent.kafka.serializers.KafkaAvroDeserializerConfig;
 import io.confluent.kafka.serializers.KafkaAvroSerializerConfig;
-import java.time.Duration;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.*;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
-import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule;
@@ -48,6 +42,7 @@ import org.slf4j.LoggerFactory;
 public class AvroFormat extends AbstractFormat {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(AvroFormat.class);
+  private static final ObjectMapper MAPPER = new ObjectMapper();
 
   private KafkaConsumer<String, GenericRecord> consumer;
 
@@ -93,7 +88,11 @@ public class AvroFormat extends AbstractFormat {
     switch (subscription.get("subscription_type").asText()) {
       case "subscribe" -> {
         final String topicPattern = subscription.get("topic_pattern").asText();
-        consumer.subscribe(Pattern.compile(topicPattern));
+        if (shouldManageOffsets()) {
+          consumer.subscribe(Pattern.compile(topicPattern), statefulRebalanceListener(consumer));
+        } else {
+          consumer.subscribe(Pattern.compile(topicPattern));
+        }
         topicsToSubscribe = consumer.listTopics().keySet().stream()
             .filter(topic -> topic.matches(topicPattern))
             .collect(Collectors.toSet());
@@ -110,6 +109,7 @@ public class AvroFormat extends AbstractFormat {
         }).collect(Collectors.toList());
         LOGGER.info("Topic-partition list: {}", topicPartitionList);
         consumer.assign(topicPartitionList);
+        seekToStateOrConfiguredStart(consumer, topicPartitionList);
       }
     }
     return consumer;
@@ -152,81 +152,37 @@ public class AvroFormat extends AbstractFormat {
   }
 
   @Override
-  public AutoCloseableIterator<AirbyteMessage> read() {
+  public AutoCloseableIterator<AirbyteMessage> read(final JsonNode state) {
+    prepareForRead(state);
+    return readRecords(getConsumer(), this::toAirbyteMessage);
+  }
 
-    final KafkaConsumer<String, GenericRecord> consumer = getConsumer();
-    final List<ConsumerRecord<String, GenericRecord>> recordsList = new ArrayList<>();
-    final int retry = config.has("repeated_calls") ? config.get("repeated_calls").intValue() : 0;
-    final int polling_time = config.has("polling_time") ? config.get("polling_time").intValue() : 100;
-    final int max_records = config.has("max_records_process") ? config.get("max_records_process").intValue() : 100000;
-    AtomicInteger record_count = new AtomicInteger();
-    final Map<String, Integer> poll_lookup = new HashMap<>();
-    getTopicsToSubscribe().forEach(topic -> poll_lookup.put(topic, 0));
-    while (true) {
-      final ConsumerRecords<String, GenericRecord> consumerRecords = consumer
-          .poll(Duration.of(polling_time, ChronoUnit.MILLIS));
-      consumerRecords.forEach(record -> {
-        record_count.getAndIncrement();
-        recordsList.add(record);
-      });
-      consumer.commitAsync();
-
-      if (consumerRecords.count() == 0) {
-        consumer.assignment().stream().map(record -> record.topic()).distinct().forEach(
-            topic -> {
-              poll_lookup.put(topic, poll_lookup.get(topic) + 1);
-            });
-        boolean is_complete = poll_lookup.entrySet().stream().allMatch(
-            e -> e.getValue() > retry);
-        if (is_complete) {
-          LOGGER.info("There is no new data in the queue!!");
-          break;
-        }
-      } else if (record_count.get() > max_records) {
-        LOGGER.info("Max record count is reached !!");
-        break;
+  private AirbyteMessage toAirbyteMessage(final ConsumerRecord<String, GenericRecord> record) {
+    final GenericRecord avroData = record.value();
+    final String namespace = avroData.getSchema().getNamespace();
+    final String name = avroData.getSchema().getName();
+    final JsonNode output;
+    try {
+      if (StringUtils.isNoneEmpty(namespace) && StringUtils.isNoneEmpty(name)) {
+        final ObjectNode namespaceNode = MAPPER.createObjectNode();
+        namespaceNode.put("avro_schema", namespace);
+        namespaceNode.put("name", name);
+        output = MAPPER.readTree(avroData.toString());
+        ((ObjectNode) output).set("_namespace_", namespaceNode);
+      } else {
+        output = MAPPER.readTree(avroData.toString());
       }
+    } catch (final JsonProcessingException e) {
+      LOGGER.error("Exception whilst reading avro data from stream", e);
+      throw new RuntimeException(e);
     }
-    consumer.close();
-    final Iterator<ConsumerRecord<String, GenericRecord>> iterator = recordsList.iterator();
-    return AutoCloseableIterators.fromIterator(new AbstractIterator<>() {
 
-      @Override
-      protected AirbyteMessage computeNext() {
-        if (iterator.hasNext()) {
-          final ConsumerRecord<String, GenericRecord> record = iterator.next();
-          GenericRecord avro_data = record.value();
-          ObjectMapper mapper = new ObjectMapper();
-          String namespace = avro_data.getSchema().getNamespace();
-          String name = avro_data.getSchema().getName();
-          JsonNode output;
-          try {
-            // Todo dynamic namespace is not supported now hence, adding avro schema name in
-            // the message
-            if (StringUtils.isNoneEmpty(namespace) && StringUtils.isNoneEmpty(name)) {
-              String newString = String.format("{\"avro_schema\": \"%s\",\"name\":\"%s\"}", namespace, name);
-              JsonNode newNode = mapper.readTree(newString);
-              output = mapper.readTree(avro_data.toString());
-              ((ObjectNode) output).set("_namespace_", newNode);
-            } else {
-              output = mapper.readTree(avro_data.toString());
-            }
-          } catch (JsonProcessingException e) {
-            LOGGER.error("Exception whilst reading avro data from stream", e);
-            throw new RuntimeException(e);
-          }
-          return new AirbyteMessage()
-              .withType(AirbyteMessage.Type.RECORD)
-              .withRecord(new AirbyteRecordMessage()
-                  .withStream(record.topic())
-                  .withEmittedAt(Instant.now().toEpochMilli())
-                  .withData(Jsons.jsonNode(ImmutableMap.builder().put("value", output).build())));
-        }
-
-        return endOfData();
-      }
-
-    });
+    return new AirbyteMessage()
+        .withType(AirbyteMessage.Type.RECORD)
+        .withRecord(new AirbyteRecordMessage()
+            .withStream(record.topic())
+            .withEmittedAt(Instant.now().toEpochMilli())
+            .withData(Jsons.jsonNode(ImmutableMap.builder().put("value", output).build())));
   }
 
 }
