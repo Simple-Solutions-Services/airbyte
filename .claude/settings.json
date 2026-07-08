@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(grep -rn \"SyncMode\\\\|withSupportedSyncModes\\\\|withSourceDefinedCursor\" airbyte-integrations/connectors/source-kafka/src/main/java/io/airbyte/integrations/source/kafka/format/JsonFormat.java | head -5; echo \"---protocol models---\"; find ~/.gradle -name \"airbyte-protocol*.jar\" 2>/dev/null | head -3; grep -rn \"AirbyteStreamState\\\\|StreamDescriptor\" airbyte-integrations/connectors/source-kafka/src/main/java/ | head)",
-      "Read(//home/mikeadam/.gradle/**)"
+      "Read(//home/mikeadam/.gradle/**)",
+      "Bash(python3 /tmp/claude-1000/-home-mikeadam-projects-Pandora-airbyte/aa9010a8-acde-4a4c-b61b-164ca243b658/scratchpad/e2e/analyze.py /tmp/claude-1000/-home-mikeadam-projects-Pandora-airbyte/aa9010a8-acde-4a4c-b61b-164ca243b658/scratchpad/e2e/run1.out /tmp/claude-1000/-home-mikeadam-projects-Pandora-airbyte/aa9010a8-acde-4a4c-b61b-164ca243b658/scratchpad/e2e/state1.json)"
     ]
   }
 }
