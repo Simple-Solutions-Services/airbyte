@@ -12,6 +12,10 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 import org.apache.kafka.common.TopicPartition;
 
 final class KafkaOffsetState {
@@ -51,11 +55,34 @@ final class KafkaOffsetState {
     return offsets.isEmpty();
   }
 
+  /**
+   * Topics that have at least one tracked offset, in deterministic (sorted) order.
+   */
+  Set<String> topics() {
+    return offsets.keySet().stream()
+        .map(TopicPartition::topic)
+        .collect(Collectors.toCollection(TreeSet::new));
+  }
+
   JsonNode toJson() {
+    return toJson(topicPartition -> true);
+  }
+
+  /**
+   * Serializes the offsets of a single topic — used as the per-stream state payload of an Airbyte
+   * STREAM state message. Keeps the same {@code {"offsets": {topic: {partition: offset}}}} shape as
+   * {@link #toJson()} so {@link #fromJson(JsonNode)} can parse either form unchanged.
+   */
+  JsonNode toJson(final String topic) {
+    return toJson(topicPartition -> topicPartition.topic().equals(topic));
+  }
+
+  private JsonNode toJson(final Predicate<TopicPartition> topicPartitionFilter) {
     final ObjectNode root = MAPPER.createObjectNode();
     final ObjectNode offsetsNode = root.putObject(OFFSETS_FIELD);
 
     offsets.entrySet().stream()
+        .filter(entry -> topicPartitionFilter.test(entry.getKey()))
         .sorted(Comparator
             .comparing((Map.Entry<TopicPartition, Long> entry) -> entry.getKey().topic())
             .thenComparingInt(entry -> entry.getKey().partition()))
